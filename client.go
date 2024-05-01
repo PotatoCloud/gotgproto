@@ -25,7 +25,7 @@ import (
 	"go.uber.org/zap"
 )
 
-const VERSION = "v1.0.0-beta17"
+const VERSION = "v1.0.0-beta18"
 
 type Client struct {
 	// Dispatcher handlers the incoming updates and execute mapped handlers. It is recommended to use dispatcher.MakeDispatcher function for this field.
@@ -76,9 +76,12 @@ type Client struct {
 	// PeerStorage is the storage for all the peers.
 	// It is recommended to use storage.NewPeerStorage function for this field.
 	PeerStorage *storage.PeerStorage
+	// NoAutoAuth is a flag to disable automatic authentication
+	// if the current session is invalid.
+	NoAutoAuth bool
 
 	authConversator AuthConversator
-	clientType      ClientType
+	clientType      clientType
 	ctx             context.Context
 	err             error
 	autoFetchReply  bool
@@ -87,16 +90,6 @@ type Client struct {
 	*telegram.Client
 	appId   int
 	apiHash string
-}
-
-// Type of client to login to, can be of 2 types:
-// 1.) Bot  (Fill BotToken in this case)
-// 2.) User (Fill Phone in this case)
-type ClientType struct {
-	// BotToken is the unique API Token for the bot you're trying to authorize, get it from @BotFather.
-	BotToken string
-	// Mobile number of the authenticating user.
-	Phone string
 }
 
 type ClientOpts struct {
@@ -176,10 +169,13 @@ type ClientOpts struct {
 	// If < 0, compression will be disabled.
 	// If == 0, default value will be used.
 	CompressThreshold int
+	// NoAutoAuth is a flag to disable automatic authentication
+	// if the current session is invalid.
+	NoAutoAuth bool
 }
 
 // NewClient creates a new gotgproto client and logs in to telegram.
-func NewClient(appId int, apiHash string, cType ClientType, opts *ClientOpts) (*Client, error) {
+func NewClient(appId int, apiHash string, cType clientType, opts *ClientOpts) (*Client, error) {
 	if opts == nil {
 		opts = &ClientOpts{
 			SystemLangCode: "en",
@@ -221,6 +217,7 @@ func NewClient(appId int, apiHash string, cType ClientType, opts *ClientOpts) (*
 		Logger:            opts.Logger,
 		SystemLangCode:    opts.SystemLangCode,
 		ClientLangCode:    opts.ClientLangCode,
+		NoAutoAuth:        opts.NoAutoAuth,
 		authConversator:   opts.AuthConversator,
 		Dispatcher:        d,
 		PeerStorage:       peerStorage,
@@ -274,18 +271,29 @@ func (c *Client) initTelegramClient(
 
 func (c *Client) login() error {
 	authClient := c.Auth()
-
-	if c.clientType.BotToken == "" {
-		if err := ifAuthNecessary(c.ctx, authClient, c.authConversator, c.clientType.Phone, auth.SendCodeOptions{}); err != nil {
-			return err
+	status, err := authClient.Status(c.ctx)
+	if err != nil {
+		return errors.Wrap(err, "auth status")
+	}
+	if status.Authorized {
+		return nil
+	}
+	if c.NoAutoAuth {
+		return intErrors.ErrSessionUnauthorized
+	}
+	if c.clientType.getType() == clientTypeVPhone {
+		err = authFlow(
+			c.ctx, authClient,
+			c.authConversator,
+			c.clientType.getValue(),
+			auth.SendCodeOptions{},
+		)
+		if err != nil {
+			return errors.Wrap(err, "auth flow")
 		}
 	} else {
-		status, err := authClient.Status(c.ctx)
-		if err != nil {
-			return errors.Wrap(err, "auth status")
-		}
 		if !status.Authorized {
-			if _, err := c.Auth().Bot(c.ctx, c.clientType.BotToken); err != nil {
+			if _, err := c.Auth().Bot(c.ctx, c.clientType.getValue()); err != nil {
 				return errors.Wrap(err, "login")
 			}
 		}
